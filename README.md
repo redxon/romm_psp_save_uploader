@@ -16,7 +16,7 @@ Unofficial community helper, MIT licensed. Runs with Python 3.8+ (standard libra
 
 ## Setup
 
-1. Download `psp_saves.py`, `.env.example` and `docker-compose.yml` into one folder.
+1. Download `psp_saves.py`, `.env.example` and `compose.yaml` into one folder.
 2. Copy `.env.example` to `.env` and fill in at least:
    - `ROMM_URL`: your RomM address
    - `ROMM_TOKEN`: RomM → profile → API tokens
@@ -44,7 +44,7 @@ docker compose run --rm psp-saves --upload     # writes and uploads
 
 Your `SAVEDATA` folder is mounted read-only. With Docker, `ROMM_URL` is resolved from inside the
 container: `localhost` there is the container itself, so use the host's IP or hostname, or join
-RomM's Docker network (commented example in `docker-compose.yml`) and use `http://romm:8080`.
+RomM's Docker network (commented example in `compose.yaml`) and use `http://romm:8080`.
 On Linux, files written to `OUT_DIR` by the container belong to root.
 
 Without Compose:
@@ -56,9 +56,9 @@ docker run --rm --env-file .env -e SAVEDATA_DIR=/savedata -e OUT_DIR=/out \
   python:3.12-slim python /app/psp_saves.py --upload
 ```
 
-**Test with one game first:** point `SAVEDATA_DIR` at a folder containing a single save
-folder, run with `--upload`, then start that game via *Stream* in RomM. The save should be
-offered on the launch screen.
+**Test with one game first:** run `python3 psp_saves.py --upload --only ULUS10336` (the serial
+from the dry run), then start that game via *Stream* in RomM. The save should be offered on the
+launch screen. `--only` is also the way to retry a single game later without touching the others.
 
 ## How it matches
 
@@ -95,6 +95,7 @@ offered on the launch screen.
 | `SERIAL_MAP` | `--map SERIAL=ROM` | Manual matches (`;`-separated in `.env`, repeatable on the CLI) |
 | `UPLOAD` | `--upload` | Upload to RomM (`emulator=ppsspp`, no slot); implies building the archives |
 | `FORCE` | `--force` | Upload even if the game already has a `ppsspp` save |
+| `ONLY` | `--only SERIAL` | Process only these games (`;`/`,`-separated in `.env`; repeatable on the CLI, where it replaces the `.env` value). A full folder name like `ULUS10041DATA00` works too |
 | `LAYOUT` | `--layout` | `savedata` (webstation format) or `flat` (without `SAVEDATA/`) |
 | `LIBRARY_PATH` | `--library-path` | `library_path` of your webstation container, written into the manifest |
 | – | `--env-file FILE` | Use another settings file (default `./.env`, then `.env` next to the script) |
