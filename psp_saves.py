@@ -4,20 +4,17 @@ psp_saves.py - import PPSSPP save folders into RomM so webstation (emulator stre
 
 Unofficial community helper, MIT licensed. Python 3.8+, standard library only.
 
-  python3 psp_saves.py SAVEDATA_DIR                       # show which save belongs to which RomM game
-  python3 psp_saves.py SAVEDATA_DIR --zip OUT             # build the archives
-  python3 psp_saves.py SAVEDATA_DIR --zip OUT --upload    # ...and upload them to RomM
+All settings live in a .env file (see .env.example); command-line options override them.
 
-  ROMM_URL / ROMM_TOKEN   RomM address and an API token (needed for matching by RomM and for --upload)
-  [ROMS_DIR]              optional: match against a local roms/psp folder instead of RomM's game list
-  --map SERIAL=ROM        manual match, ROM = file name without extension (as in RomM)
-  --library-path PATH     library_path of your webstation container in config.yml (default /romm/library)
-  --force                 upload even if the game already has a ppsspp save in RomM
+  python3 psp_saves.py                  # dry run: which save belongs to which RomM game
+  python3 psp_saves.py --zip            # also build the archives into OUT_DIR
+  python3 psp_saves.py --upload         # build and upload them to RomM
 
 Archive format = what webstation's PPSSPP writes itself (verified with RomM 5.3.1):
   "<ROM> [ppsspp <date time>].saves.zip" containing SAVEDATA/<FOLDER>/<files> + .broker-manifest.json,
   uploaded with emulator=ppsspp and no slot.
 """
+
 import argparse, json, os, re, struct, time, urllib.parse, urllib.request, uuid, zipfile
 from collections import defaultdict
 
@@ -98,19 +95,77 @@ def romm_psp_roms():
     return out
 
 
+def load_env_file(path):
+    """Minimal .env reader: KEY=VALUE lines, # comments, optional quotes. Real env vars win."""
+    if not path or not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.strip()
+            if key.startswith("export "):
+                key = key[7:].strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]
+            else:
+                val = val.split(" #", 1)[0].strip()
+            os.environ.setdefault(key, val)
+    return True
+
+
+def env_bool(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("savedata")
-    ap.add_argument("roms", nargs="?", help="optional local roms/psp folder (default: RomM's game list)")
-    ap.add_argument("--zip", metavar="OUT_DIR")
-    ap.add_argument("--layout", choices=["savedata", "flat"], default="savedata")
-    ap.add_argument("--library-path", default="/romm/library",
-                    help="library path as the webstation container sees it (config.yml library_path)")
-    ap.add_argument("--upload", action="store_true", help="upload the zips to RomM (needs ROMM_URL/TOKEN)")
-    ap.add_argument("--force", action="store_true", help="upload even if a ppsspp save already exists")
-    ap.add_argument("--map", action="append", default=[], metavar="SERIAL=ROM",
-                    help='manual match, e.g. --map "ULUS10041=Grand Theft Auto - Liberty City Stories (USA)"')
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--env-file")
+    known, _ = pre.parse_known_args()
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [known.env_file] if known.env_file else [os.path.join(os.getcwd(), ".env"), os.path.join(here, ".env")]
+    for candidate in candidates:
+        if load_env_file(candidate):
+            break
+    else:
+        if known.env_file:
+            raise SystemExit(f"env file not found: {known.env_file}")
+    E = os.environ.get
+
+    ap = argparse.ArgumentParser(description="Import PPSSPP saves into RomM for webstation. "
+                                             "Settings come from .env; options below override them.")
+    ap.add_argument("--env-file", help="settings file (default: ./.env, then .env next to the script)")
+    ap.add_argument("savedata", nargs="?", default=E("SAVEDATA_DIR"), help="SAVEDATA folder [SAVEDATA_DIR]")
+    ap.add_argument("roms", nargs="?", default=E("ROMS_DIR") or None,
+                    help="optional local roms/psp folder instead of RomM's game list [ROMS_DIR]")
+    ap.add_argument("--zip", nargs="?", const=E("OUT_DIR") or "./psp-saves", default=None, metavar="OUT_DIR",
+                    help="build the archives [OUT_DIR, default ./psp-saves]")
+    ap.add_argument("--layout", choices=["savedata", "flat"], default=E("LAYOUT") or "savedata")
+    ap.add_argument("--library-path", default=E("LIBRARY_PATH") or "/romm/library",
+                    help="library_path of the webstation container in config.yml [LIBRARY_PATH]")
+    ap.add_argument("--upload", action="store_true", default=env_bool("UPLOAD"),
+                    help="upload the archives to RomM, implies --zip [UPLOAD]")
+    ap.add_argument("--force", action="store_true", default=env_bool("FORCE"),
+                    help="upload even if a ppsspp save already exists [FORCE]")
+    ap.add_argument("--map", action="append",
+                    default=[m.strip() for m in E("SERIAL_MAP", "").split(";") if m.strip()],
+                    metavar="SERIAL=ROM", help="manual match, repeatable [SERIAL_MAP, ';'-separated]")
     a = ap.parse_args()
+    if not a.savedata:
+        raise SystemExit("set SAVEDATA_DIR in .env or pass the SAVEDATA folder as first argument")
+    if not os.path.isdir(a.savedata):
+        raise SystemExit(f"SAVEDATA folder not found: {a.savedata}")
+    if a.roms and not os.path.isdir(a.roms):
+        raise SystemExit(f"ROMS_DIR not found: {a.roms}")
+    if a.upload and not a.zip:
+        a.zip = E("OUT_DIR") or "./psp-saves"
+    if a.upload and not (E("ROMM_URL") and E("ROMM_TOKEN")):
+        raise SystemExit("--upload needs ROMM_URL and ROMM_TOKEN in .env")
+    bad = [m for m in a.map if "=" not in m]
+    if bad:
+        raise SystemExit(f"invalid SERIAL_MAP entry (expected SERIAL=ROM): {bad[0]}")
 
     roms, rom_file = {}, {}
     romm = romm_psp_roms()
@@ -135,7 +190,7 @@ def main():
         games[serial]["folders"].append(d)
         games[serial]["title"] = games[serial]["title"] or sfo.get("TITLE", "")
 
-    manual = dict(m.split("=", 1) for m in a.map)
+    manual = {k.strip().upper(): v.strip() for k, v in (m.split("=", 1) for m in a.map)}
     for serial, g in games.items():
         rom = manual.get(serial)
         if not rom and g["title"]:

@@ -1,0 +1,26 @@
+# Run without installing Python:
+#   docker compose run --rm psp-saves              # dry run
+#   docker compose run --rm psp-saves --upload     # build + upload
+# Paths and credentials come from .env (same file the script uses when run directly).
+services:
+  psp-saves:
+    image: python:3.12-slim
+    working_dir: /app
+    entrypoint: ["python", "/app/psp_saves.py"]
+    env_file: .env
+    environment:
+      # inside the container the folders are always mounted at these paths
+      SAVEDATA_DIR: /savedata
+      OUT_DIR: /out
+      ROMS_DIR: ${ROMS_DIR:+/roms}
+    volumes:
+      - ./psp_saves.py:/app/psp_saves.py:ro
+      - ${SAVEDATA_DIR:?set SAVEDATA_DIR in .env}:/savedata:ro
+      - ${OUT_DIR:-./psp-saves}:/out
+      - ${ROMS_DIR:-./psp-saves}:/roms:ro
+    # If RomM runs in Docker on the same host, you can join its network and use ROMM_URL=http://romm:8080
+    # networks: [romm_net]
+# networks:
+#   romm_net:
+#     external: true
+#     name: <your RomM network>

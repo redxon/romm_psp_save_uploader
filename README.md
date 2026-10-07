@@ -5,7 +5,7 @@ PSP saves aren't single files. Each one is a folder (`SAVEDATA/ULUS10336DATA00/`
 shows "No saves yet". This script packs each game's save folders into the exact archive
 format webstation's PPSSPP writes itself, matches them to your RomM games, and uploads them.
 
-Unofficial community helper, MIT licensed. Python 3.8+, standard library only, no installs.
+Unofficial community helper, MIT licensed. Runs with Python 3.8+ (standard library only) or Docker.
 
 ## Requirements
 
@@ -14,30 +14,51 @@ Unofficial community helper, MIT licensed. Python 3.8+, standard library only, n
 - An API token: RomM → profile → API tokens (read ROMs/platforms, write assets)
 - Your PPSSPP `SAVEDATA` folder (from a PC, Android, a handheld, a Syncthing folder, …)
 
+## Setup
+
+1. Download `psp_saves.py`, `.env.example` and `docker-compose.yml` into one folder.
+2. Copy `.env.example` to `.env` and fill in at least:
+   - `ROMM_URL`: your RomM address
+   - `ROMM_TOKEN`: RomM → profile → API tokens
+   - `SAVEDATA_DIR`: your PPSSPP `SAVEDATA` folder (subfolders look like `ULUS10336DATA00`)
+
+Every setting is documented in `.env.example`. Both ways of running below read the same `.env`,
+and anything given on the command line overrides it.
+
 ## Usage
 
-```bash
-export ROMM_URL="https://romm.example.com"      # or http://<ip>:<port>
-export ROMM_TOKEN="rmm_…"
-
-# 1. Dry run: which save belongs to which game?
-python3 psp_saves.py /path/to/PSP/SAVEDATA
-
-# 2. Build the archives and upload them
-python3 psp_saves.py /path/to/PSP/SAVEDATA --zip ./psp-saves --upload
-```
-
-Test with **one game** first: copy a single save folder into an empty directory and point
-the script at that. Then start the game via Stream in RomM. The save should be offered on the
-launch screen.
-
-With Docker instead of a local Python (mount the save folder read-only):
+**With Python** (3.8 or newer, nothing to install):
 
 ```bash
-docker run --rm -v "$PWD":/w -w /w -v "/path/to/PSP/SAVEDATA":/savedata:ro \
-  -e ROMM_URL -e ROMM_TOKEN python:3.12-slim \
-  python psp_saves.py /savedata --zip ./psp-saves --upload
+python3 psp_saves.py              # dry run: shows which save goes to which game
+python3 psp_saves.py --zip        # also writes the archives to OUT_DIR
+python3 psp_saves.py --upload     # writes and uploads them
 ```
+
+**With Docker** (no Python needed; the official `python:3.12-slim` image runs the script):
+
+```bash
+docker compose run --rm psp-saves              # dry run
+docker compose run --rm psp-saves --upload     # writes and uploads
+```
+
+Your `SAVEDATA` folder is mounted read-only. With Docker, `ROMM_URL` is resolved from inside the
+container: `localhost` there is the container itself, so use the host's IP or hostname, or join
+RomM's Docker network (commented example in `docker-compose.yml`) and use `http://romm:8080`.
+On Linux, files written to `OUT_DIR` by the container belong to root.
+
+Without Compose:
+
+```bash
+docker run --rm --env-file .env -e SAVEDATA_DIR=/savedata -e OUT_DIR=/out \
+  -v "$PWD/psp_saves.py":/app/psp_saves.py:ro \
+  -v "/path/to/PSP/SAVEDATA":/savedata:ro -v "$PWD/psp-saves":/out \
+  python:3.12-slim python /app/psp_saves.py --upload
+```
+
+**Test with one game first:** point `SAVEDATA_DIR` at a folder containing a single save
+folder, run with `--upload`, then start that game via *Stream* in RomM. The save should be
+offered on the launch screen.
 
 ## How it matches
 
@@ -57,22 +78,29 @@ docker run --rm -v "$PWD":/w -w /w -v "/path/to/PSP/SAVEDATA":/savedata:ro \
 | `skipped` | several saves for one ROM; the one matching the ROM's region is kept |
 
 - **No match?** This happens with Japanese save titles or very different names. Look up the
-  serial online, then add `--map "ULUS10041=<ROM file name without extension>"` (the exact file
-  name as it appears in RomM).
+  serial online, then add it to `SERIAL_MAP` in `.env` (several entries separated by `;`):
+  `SERIAL_MAP=ULUS10041=Grand Theft Auto - Liberty City Stories (USA)`. The value is the ROM
+  file name without extension, exactly as it appears in RomM.
 - **Duplicates:** games that already have a `ppsspp` save in RomM are skipped. Use `--force` to
   upload anyway.
 
-## Options
+## Settings
 
-| Option | |
-|---|---|
-| `ROMS_DIR` (2nd argument) | Match against a local `roms/psp` folder instead of RomM's game list |
-| `--zip DIR` | Where to write the archives (the source folder is only read) |
-| `--upload` | Upload to RomM (`emulator=ppsspp`, no slot) |
-| `--map SERIAL=ROM` | Manual match, can be repeated |
-| `--layout flat` | Archives without the `SAVEDATA/` level (for experiments with other clients) |
-| `--library-path` | `library_path` of your webstation container in `config.yml`. It's written into the archive's manifest; default `/romm/library` |
-| `--force` | Upload even if a `ppsspp` save already exists |
+| `.env` | Command line | |
+|---|---|---|
+| `ROMM_URL`, `ROMM_TOKEN` | – | RomM address and API token |
+| `SAVEDATA_DIR` | 1st argument | PPSSPP `SAVEDATA` folder (only read) |
+| `OUT_DIR` | `--zip DIR` | Where archives are written (default `./psp-saves`) |
+| `ROMS_DIR` | 2nd argument | Match against a local `roms/psp` folder instead of RomM's game list |
+| `SERIAL_MAP` | `--map SERIAL=ROM` | Manual matches (`;`-separated in `.env`, repeatable on the CLI) |
+| `UPLOAD` | `--upload` | Upload to RomM (`emulator=ppsspp`, no slot); implies building the archives |
+| `FORCE` | `--force` | Upload even if the game already has a `ppsspp` save |
+| `LAYOUT` | `--layout` | `savedata` (webstation format) or `flat` (without `SAVEDATA/`) |
+| `LIBRARY_PATH` | `--library-path` | `library_path` of your webstation container, written into the manifest |
+| – | `--env-file FILE` | Use another settings file (default `./.env`, then `.env` next to the script) |
+
+Environment variables that are already set win over `.env`, so CI or one-off overrides like
+`FORCE=true python3 psp_saves.py --upload` work too.
 
 ## Archive format
 
