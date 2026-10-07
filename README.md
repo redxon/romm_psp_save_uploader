@@ -16,7 +16,7 @@ Unofficial community helper, MIT licensed. Runs with Python 3.8+ (standard libra
 
 ## Setup
 
-1. Download `psp_saves.py`, `.env.example` and `docker-compose.yml` into one folder.
+1. Download `psp_saves.py`, `.env.example` and `compose.yaml` into one folder.
 2. Copy `.env.example` to `.env` and fill in at least:
    - `ROMM_URL`: your RomM address
    - `ROMM_TOKEN`: RomM → profile → API tokens
@@ -44,7 +44,7 @@ docker compose run --rm psp-saves --upload     # writes and uploads
 
 Your `SAVEDATA` folder is mounted read-only. With Docker, `ROMM_URL` is resolved from inside the
 container: `localhost` there is the container itself, so use the host's IP or hostname, or join
-RomM's Docker network (commented example in `docker-compose.yml`) and use `http://romm:8080`.
+RomM's Docker network (commented example in `compose.yaml`) and use `http://romm:8080`.
 On Linux, files written to `OUT_DIR` by the container belong to root.
 
 Without Compose:
