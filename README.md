@@ -56,9 +56,9 @@ docker run --rm --env-file .env -e SAVEDATA_DIR=/savedata -e OUT_DIR=/out \
   python:3.12-slim python /app/psp_saves.py --upload
 ```
 
-**Test with one game first:** point `SAVEDATA_DIR` at a folder containing a single save
-folder, run with `--upload`, then start that game via *Stream* in RomM. The save should be
-offered on the launch screen.
+**Test with one game first:** run `python3 psp_saves.py --upload --only ULUS10336` (the serial
+from the dry run), then start that game via *Stream* in RomM. The save should be offered on the
+launch screen. `--only` is also the way to retry a single game later without touching the others.
 
 ## How it matches
 
@@ -95,6 +95,7 @@ offered on the launch screen.
 | `SERIAL_MAP` | `--map SERIAL=ROM` | Manual matches (`;`-separated in `.env`, repeatable on the CLI) |
 | `UPLOAD` | `--upload` | Upload to RomM (`emulator=ppsspp`, no slot); implies building the archives |
 | `FORCE` | `--force` | Upload even if the game already has a `ppsspp` save |
+| `ONLY` | `--only SERIAL` | Process only these games (`;`/`,`-separated in `.env`; repeatable on the CLI, where it replaces the `.env` value). A full folder name like `ULUS10041DATA00` works too |
 | `LAYOUT` | `--layout` | `savedata` (webstation format) or `flat` (without `SAVEDATA/`) |
 | `LIBRARY_PATH` | `--library-path` | `library_path` of your webstation container, written into the manifest |
 | – | `--env-file FILE` | Use another settings file (default `./.env`, then `.env` next to the script) |

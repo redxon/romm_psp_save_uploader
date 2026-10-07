@@ -9,6 +9,7 @@ All settings live in a .env file (see .env.example); command-line options overri
   python3 psp_saves.py                  # dry run: which save belongs to which RomM game
   python3 psp_saves.py --zip            # also build the archives into OUT_DIR
   python3 psp_saves.py --upload         # build and upload them to RomM
+  python3 psp_saves.py --upload --only ULUS10041   # just one game (repeatable)
 
 Archive format = what webstation's PPSSPP writes itself (verified with RomM 5.3.1):
   "<ROM> [ppsspp <date time>].saves.zip" containing SAVEDATA/<FOLDER>/<files> + .broker-manifest.json,
@@ -152,6 +153,8 @@ def main():
     ap.add_argument("--map", action="append",
                     default=[m.strip() for m in E("SERIAL_MAP", "").split(";") if m.strip()],
                     metavar="SERIAL=ROM", help="manual match, repeatable [SERIAL_MAP, ';'-separated]")
+    ap.add_argument("--only", action="append", metavar="SERIAL",
+                    help="process only these games, repeatable; replaces ONLY from .env [ONLY, ';'/','-separated]")
     a = ap.parse_args()
     if not a.savedata:
         raise SystemExit("set SAVEDATA_DIR in .env or pass the SAVEDATA folder as first argument")
@@ -180,15 +183,27 @@ def main():
         roms.setdefault(title_key(stem), stem)
         rom_file.setdefault(stem, fn)
 
+    # "ULUS10041" or a full folder name like "ULUS10041DATA00" both select the game ULUS10041
+    only_list = a.only if a.only is not None else re.split(r"[;,\s]+", E("ONLY", ""))
+    only = {x.strip().upper()[:9] for x in only_list if x.strip()}
     games = defaultdict(lambda: {"folders": [], "title": ""})
     for d in sorted(os.listdir(a.savedata)):
         p = os.path.join(a.savedata, d)
         if not os.path.isdir(p) or d.startswith(".") or d.upper().startswith(SYSTEM_PREFIXES):
             continue
         serial = d[:9].upper()
+        if only and serial not in only:
+            continue
         sfo = read_sfo(os.path.join(p, "PARAM.SFO")) if os.path.isfile(os.path.join(p, "PARAM.SFO")) else {}
         games[serial]["folders"].append(d)
         games[serial]["title"] = games[serial]["title"] or sfo.get("TITLE", "")
+
+    if only:
+        missing = sorted(only - set(games))
+        if missing:
+            print(f"! not found in {a.savedata}: {', '.join(missing)}")
+        if not games:
+            raise SystemExit("nothing to do: none of the --only serials have a save folder")
 
     manual = {k.strip().upper(): v.strip() for k, v in (m.split("=", 1) for m in a.map)}
     for serial, g in games.items():
