@@ -16,14 +16,17 @@ Archive format = what webstation's PPSSPP writes itself (verified with RomM 5.3.
   uploaded with emulator=ppsspp and no slot.
 """
 
-import argparse, json, os, re, struct, time, urllib.parse, urllib.request, uuid, zipfile
+import argparse, json, os, re, struct, time, urllib.parse, urllib.request, uuid, zipfile, zlib
 from collections import defaultdict
 
 
 def read_sfo(path):
     """Parse a PSF/SFO file into {key: value}."""
     with open(path, "rb") as f:
-        data = f.read()
+        return parse_sfo(f.read())
+
+
+def parse_sfo(data):
     if data[:4] != b"\0PSF":
         return {}
     key_start, data_start, count = struct.unpack_from("<III", data, 8)
@@ -56,16 +59,163 @@ def serial_region(serial):
     return REGION_OF_CODE.get(serial[2:3].upper(), "") if re.match(r"^[A-Z]{4}\d{5}", serial) else ""
 
 
-def rom_region(stem):
+def rom_region(stem, serial=""):
+    """(region, serial) of a ROM: serial read from the file, else a [ULUS10041] tag, else region words."""
     m = re.search(r"\[([A-Z]{4}\d{5})\]", stem)
-    if m:
-        return serial_region(m.group(1)), m.group(1)
+    serial = serial or (m.group(1) if m else "")
+    if serial:
+        return serial_region(serial), serial
     for tag in re.findall(r"\(([^)]*)\)", stem):
         for part in tag.split(","):
             r = REGION_OF_TAG.get(part.strip().lower())
             if r:
                 return r, ""
     return "", ""
+
+
+# --- serial from the ROM itself (ROMS_DIR only) ---------------------------------------------------
+SECTOR = 2048
+READ_ERRORS = (OSError, ValueError, IndexError, KeyError, struct.error, zlib.error)
+
+
+def norm_serial(s):
+    """'ULUS-10041|7B6A...|0001|G' or 'ULUS10041' -> 'ULUS10041', anything else -> None."""
+    s = (s or "").split("|")[0].replace("-", "").strip().upper()
+    return s if re.match(r"^[A-Z]{4}\d{5}$", s) else None
+
+
+def iso_serial(read):
+    """Serial of an ISO9660 image, given read(offset, size): root UMD_DATA.BIN, else PSP_GAME/PARAM.SFO."""
+    pvd = read(16 * SECTOR, SECTOR)
+    if pvd[1:6] != b"CD001":
+        return None
+
+    def extent(rec, limit):
+        lba, size = struct.unpack_from("<I4xI", rec, 2)     # little-endian halves of the both-endian fields
+        return read(lba * SECTOR, min(size, limit))
+
+    def lookup(dir_rec, name):
+        data, pos = extent(dir_rec, 1 << 20), 0
+        while pos < len(data):
+            n = data[pos]
+            if n == 0:                         # records never cross a sector; rest of this one is padding
+                pos = (pos // SECTOR + 1) * SECTOR
+                continue
+            ident = data[pos + 33:pos + 33 + data[pos + 32]].decode("ascii", "replace")
+            if ident.split(";")[0].rstrip(".").upper() == name:
+                return data[pos:pos + n]
+            pos += n
+        return None
+
+    root = pvd[156:190]
+    rec = lookup(root, "UMD_DATA.BIN")
+    serial = norm_serial(extent(rec, 4096).decode("ascii", "replace")) if rec else None
+    if not serial:
+        game = lookup(root, "PSP_GAME")
+        rec = game and lookup(game, "PARAM.SFO")
+        serial = norm_serial(str(parse_sfo(extent(rec, 1 << 16)).get("DISC_ID", ""))) if rec else None
+    return serial
+
+
+def cso_reader(f):
+    """read(offset, size) over a CSO v1/v2 image, decompressing only the blocks touched; None for ZSO/LZ4."""
+    magic, _hsize, total, bsize, ver, align = struct.unpack("<4sIQIBB", f.read(22))
+    if magic != b"CISO" or ver > 2 or not bsize:
+        return None
+
+    def block(i):
+        f.seek(24 + 4 * i)
+        a, b = struct.unpack("<II", f.read(8))
+        start, end = (a & 0x7FFFFFFF) << align, (b & 0x7FFFFFFF) << align
+        f.seek(start)
+        raw = f.read(end - start)
+        flag = a & 0x80000000
+        if ver < 2 and flag or ver == 2 and len(raw) >= bsize:
+            return raw[:bsize]                 # stored uncompressed (v1: high bit, v2: full-size block)
+        if flag:                               # v2: LZ4 block, not in the stdlib
+            raise ValueError("LZ4 block")
+        return zlib.decompressobj(-15).decompress(raw)[:bsize]
+
+    def read(offset, size):
+        out, end = b"", min(offset + size, total)
+        while offset < end:
+            i = offset // bsize
+            out += block(i)[offset - i * bsize:end - i * bsize]
+            offset = (i + 1) * bsize
+        return out
+    return read
+
+
+def pbp_serial(f):
+    """Serial of a PSN EBOOT.PBP: the header's first offset points to an embedded PARAM.SFO."""
+    hdr = f.read(40)
+    if hdr[:4] != b"\0PBP":
+        return None
+    sfo_start, sfo_end = struct.unpack_from("<II", hdr, 8)
+    f.seek(sfo_start)
+    return norm_serial(str(parse_sfo(f.read(min(max(sfo_end - sfo_start, 0), 1 << 16))).get("DISC_ID", "")))
+
+
+def rom_serial_source(path):
+    """The file to read a serial from: the ROM itself (.iso/.cso/.pbp) or a game folder's EBOOT.PBP."""
+    if os.path.isdir(path):
+        eboot = next((n for n in os.listdir(path) if n.upper() == "EBOOT.PBP"), None)
+        return os.path.join(path, eboot) if eboot else None
+    return path if path.lower().endswith((".iso", ".cso", ".pbp")) else None
+
+
+def read_rom_serial(path):
+    """Serial stored inside a ROM file, or None if the format is unknown or the file unreadable."""
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+            f.seek(0)
+            if magic == b"\0PBP":
+                return pbp_serial(f)
+            if magic == b"CISO":
+                read = cso_reader(f)
+                return iso_serial(read) if read else None
+
+            def read(offset, size):
+                f.seek(offset)
+                return f.read(size)
+            return iso_serial(read)
+    except READ_ERRORS:
+        return None
+
+
+def rom_serials(roms_dir, names, cache_path):
+    """ROM stem -> serial for every readable ROM in roms_dir; cached by file name, size and mtime."""
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    new, out = {}, {}
+    for stem, fn in names:
+        src = rom_serial_source(os.path.join(roms_dir, fn))
+        if not src:
+            continue
+        try:
+            st = os.stat(src)
+        except OSError:
+            continue
+        hit = cache.get(fn)
+        if isinstance(hit, dict) and hit.get("size") == st.st_size and hit.get("mtime") == st.st_mtime:
+            serial = hit.get("serial")
+        else:
+            serial = read_rom_serial(src)
+        new[fn] = {"size": st.st_size, "mtime": st.st_mtime, "serial": serial}
+        if serial:
+            out.setdefault(stem, serial)
+    if new != cache:
+        try:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(new, f, indent=1, sort_keys=True)
+        except OSError as e:
+            print(f"! could not write serial cache {cache_path}: {e}")
+    return out
 
 
 def api(path, method="GET", data=None, headers=None):
@@ -182,6 +332,15 @@ def main():
     for stem, fn in names:
         roms.setdefault(title_key(stem), stem)
         rom_file.setdefault(stem, fn)
+    # serials read from the ROM files themselves match exactly; RomM's game list has no file access
+    file_serial = {}
+    if a.roms:
+        cache = os.path.join(a.zip or E("OUT_DIR") or "./psp-saves", ".rom-serials.json")
+        file_serial = rom_serials(a.roms, names, cache)
+        print(f"serials read from {len(file_serial)} of {len(names)} ROMs in {a.roms}\n")
+    serial_rom = {}
+    for stem, s in sorted(file_serial.items()):
+        serial_rom.setdefault(s, stem)
 
     # "ULUS10041" or a full folder name like "ULUS10041DATA00" both select the game ULUS10041
     only_list = a.only if a.only is not None else re.split(r"[;,\s]+", E("ONLY", ""))
@@ -207,7 +366,7 @@ def main():
 
     manual = {k.strip().upper(): v.strip() for k, v in (m.split("=", 1) for m in a.map)}
     for serial, g in games.items():
-        rom = manual.get(serial)
+        rom = manual.get(serial) or serial_rom.get(serial)
         if not rom and g["title"]:
             tk = title_key(g["title"])
             rom = roms.get(tk)
@@ -221,7 +380,7 @@ def main():
         if g["rom"]:
             by_rom.setdefault(g["rom"], []).append(serial)
     for rom, serials in by_rom.items():
-        region, rom_serial = rom_region(rom)
+        region, rom_serial = rom_region(rom, file_serial.get(rom, ""))
         serials.sort(key=lambda s: (s != rom_serial, serial_region(s) != region))
         for other in serials[1:]:
             games[other]["skip"] = f"other region than ROM (kept {serials[0]})"
@@ -234,7 +393,7 @@ def main():
         elif g.get("skip"):
             check, shown = "skipped", f"{rom}  ({g['skip']})"
         else:
-            region, rom_serial = rom_region(rom)
+            region, rom_serial = rom_region(rom, file_serial.get(rom, ""))
             if rom_serial:
                 check = "serial ok" if rom_serial == serial else "SERIAL!"
             elif region:

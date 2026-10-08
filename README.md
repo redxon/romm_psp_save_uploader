@@ -64,6 +64,12 @@ launch screen. `--only` is also the way to retry a single game later without tou
 
 - **Serial:** the first 9 characters of a save folder (`ULUS10336`) are the game serial. Every
   folder of one game goes into one archive.
+- **Serial from the ROM (with `ROMS_DIR`):** the script reads each game's own serial from
+  `.iso` and `.cso` files (`UMD_DATA.BIN` or `PSP_GAME/PARAM.SFO`) and from PSN `EBOOT.PBP`
+  files or game folders containing one. A save whose serial matches a ROM is matched exactly,
+  whatever the file is called. Only a few sectors per file are read, and the results are cached in
+  `OUT_DIR/.rom-serials.json` (a file is re-read when its size or date changes). Files it can't
+  read (ZSO, CHD, archives, CSO with LZ4 blocks) fall back to title matching.
 - **Game:** identified by the `TITLE` in the save's own `PARAM.SFO` and matched against your
   RomM game list, ignoring punctuation, ™/® and region tags. A ROM named `… [ULUS10336]` is
   checked against the serial exactly.
