@@ -16,8 +16,9 @@ Archive format = what webstation's PPSSPP writes itself (verified with RomM 5.3.
   uploaded with emulator=ppsspp and no slot.
 """
 
-import argparse, json, os, re, struct, time, urllib.parse, urllib.request, uuid, zipfile, zlib
+import argparse, hashlib, io, json, os, re, struct, time, urllib.parse, urllib.request, uuid, zipfile, zlib
 from collections import defaultdict
+from datetime import datetime, timezone
 
 
 def read_sfo(path):
@@ -218,12 +219,67 @@ def rom_serials(roms_dir, names, cache_path):
     return out
 
 
-def api(path, method="GET", data=None, headers=None):
+def api(path, method="GET", data=None, headers=None, raw=False):
     url, token = os.environ.get("ROMM_URL", "").rstrip("/"), os.environ.get("ROMM_TOKEN", "")
     req = urllib.request.Request(url + path, data=data, method=method,
                                  headers={"Authorization": f"Bearer {token}", **(headers or {})})
     with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read() or b"null")
+        body = r.read()
+        return body if raw else json.loads(body or b"null")
+
+
+# --- duplicate check against RomM -----------------------------------------------------------------
+MANIFEST = ".broker-manifest.json"
+
+
+def folder_mtime(path):
+    """Newest file mtime in a save folder (the folder's own mtime if it has no files)."""
+    times = [os.path.getmtime(os.path.join(root, f)) for root, _, files in os.walk(path) for f in files]
+    return max(times) if times else os.path.getmtime(path)
+
+
+def save_hash(zf):
+    """Like RomM's content_hash, but over the save members only: our manifest holds created_at, so
+    RomM's own hash differs for every archive. 'SAVEDATA/' is dropped so both layouts compare equal."""
+    lines = []
+    for name in zf.namelist():
+        if name.endswith("/") or name == MANIFEST:
+            continue
+        key = name[9:] if name.upper().startswith("SAVEDATA/") else name
+        lines.append(f"{key}:{hashlib.md5(zf.read(name)).hexdigest()}")
+    return hashlib.md5("\n".join(sorted(lines)).encode()).hexdigest()
+
+
+def iso_time(s):
+    """RomM timestamp ('2026-09-30T15:08:37+00:00') -> epoch seconds, None if missing or unparseable."""
+    try:
+        t = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def upload_decision(rid, local_hash, local_mtime):
+    """(upload?, reason) compared with the save webstation restores by default: the newest ppsspp .zip."""
+    d = api(f"/api/roms/{rid}")
+    saves = [s for s in (d.get("user_saves") or d.get("saves") or [])
+             if (s.get("emulator") or "").lower() == "ppsspp" and (s.get("file_name") or "").endswith(".zip")]
+    if not saves:
+        return True, ""
+    newest = max(saves, key=lambda s: (iso_time(s.get("created_at")) or 0, s.get("id") or 0))
+    sid, remote_time = newest.get("id"), iso_time(newest.get("created_at"))
+    try:
+        with zipfile.ZipFile(io.BytesIO(api(f"/api/saves/{sid}/content", raw=True))) as z:
+            if save_hash(z) == local_hash:
+                return False, f"identical save already in RomM (save {sid})"
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
+        print(f"    ! could not compare with RomM save {sid} ({e}), deciding by date only")
+    if remote_time is None:
+        return False, f"RomM save {sid} has no date, can't tell which is newer (use --force)"
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(remote_time))
+    if local_mtime > remote_time:
+        return True, f"local save is newer than RomM save {sid} from {when}"
+    return False, f"RomM save {sid} from {when} is newer than the local save (use --force)"
 
 
 def romm_psp_roms():
@@ -288,7 +344,8 @@ def main():
     ap = argparse.ArgumentParser(description="Import PPSSPP saves into RomM for webstation. "
                                              "Settings come from .env; options below override them.")
     ap.add_argument("--env-file", help="settings file (default: ./.env, then .env next to the script)")
-    ap.add_argument("savedata", nargs="?", default=E("SAVEDATA_DIR"), help="SAVEDATA folder [SAVEDATA_DIR]")
+    ap.add_argument("savedata", nargs="?", default=E("SAVEDATA_DIR"),
+                    help="SAVEDATA folder, several separated by ';' (newest copy of each save wins) [SAVEDATA_DIR]")
     ap.add_argument("roms", nargs="?", default=E("ROMS_DIR") or None,
                     help="optional local roms/psp folder instead of RomM's game list [ROMS_DIR]")
     ap.add_argument("--zip", nargs="?", const=E("OUT_DIR") or "./psp-saves", default=None, metavar="OUT_DIR",
@@ -299,17 +356,19 @@ def main():
     ap.add_argument("--upload", action="store_true", default=env_bool("UPLOAD"),
                     help="upload the archives to RomM, implies --zip [UPLOAD]")
     ap.add_argument("--force", action="store_true", default=env_bool("FORCE"),
-                    help="upload even if a ppsspp save already exists [FORCE]")
+                    help="upload even if RomM already has the same or a newer ppsspp save [FORCE]")
     ap.add_argument("--map", action="append",
                     default=[m.strip() for m in E("SERIAL_MAP", "").split(";") if m.strip()],
                     metavar="SERIAL=ROM", help="manual match, repeatable [SERIAL_MAP, ';'-separated]")
     ap.add_argument("--only", action="append", metavar="SERIAL",
                     help="process only these games, repeatable; replaces ONLY from .env [ONLY, ';'/','-separated]")
     a = ap.parse_args()
-    if not a.savedata:
+    sources = [x.strip() for x in (a.savedata or "").split(";") if x.strip()]
+    if not sources:
         raise SystemExit("set SAVEDATA_DIR in .env or pass the SAVEDATA folder as first argument")
-    if not os.path.isdir(a.savedata):
-        raise SystemExit(f"SAVEDATA folder not found: {a.savedata}")
+    for src in sources:
+        if not os.path.isdir(src):
+            raise SystemExit(f"SAVEDATA folder not found: {src}")
     if a.roms and not os.path.isdir(a.roms):
         raise SystemExit(f"ROMS_DIR not found: {a.roms}")
     if a.upload and not a.zip:
@@ -345,22 +404,37 @@ def main():
     # "ULUS10041" or a full folder name like "ULUS10041DATA00" both select the game ULUS10041
     only_list = a.only if a.only is not None else re.split(r"[;,\s]+", E("ONLY", ""))
     only = {x.strip().upper()[:9] for x in only_list if x.strip()}
-    games = defaultdict(lambda: {"folders": [], "title": ""})
-    for d in sorted(os.listdir(a.savedata)):
-        p = os.path.join(a.savedata, d)
-        if not os.path.isdir(p) or d.startswith(".") or d.upper().startswith(SYSTEM_PREFIXES):
-            continue
-        serial = d[:9].upper()
-        if only and serial not in only:
-            continue
+    # several sources: each save folder is taken from the source with the newest copy of it
+    copies = defaultdict(list)
+    for src in sources:
+        for d in sorted(os.listdir(src)):
+            p = os.path.join(src, d)
+            if not os.path.isdir(p) or d.startswith(".") or d.upper().startswith(SYSTEM_PREFIXES):
+                continue
+            if only and d[:9].upper() not in only:
+                continue
+            copies[d].append((folder_mtime(p), src))
+    folder_src, multi = {}, []
+    games = defaultdict(lambda: {"folders": [], "title": "", "mtime": 0})
+    for d, found in sorted(copies.items()):
+        mtime, src = max(found, key=lambda c: c[0])    # ties: first source in the list
+        folder_src[d] = src
+        if len(found) > 1:
+            multi.append(f"  {d}: newest copy in {src} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))}),"
+                         f" also in {', '.join(s for _, s in found if s != src)}")
+        serial, p = d[:9].upper(), os.path.join(src, d)
         sfo = read_sfo(os.path.join(p, "PARAM.SFO")) if os.path.isfile(os.path.join(p, "PARAM.SFO")) else {}
-        games[serial]["folders"].append(d)
-        games[serial]["title"] = games[serial]["title"] or sfo.get("TITLE", "")
+        g = games[serial]
+        g["folders"].append(d)
+        g["title"] = g["title"] or sfo.get("TITLE", "")
+        g["mtime"] = max(g["mtime"], mtime)
+    if multi:
+        print("save folders found in several sources:\n" + "\n".join(multi) + "\n")
 
     if only:
         missing = sorted(only - set(games))
         if missing:
-            print(f"! not found in {a.savedata}: {', '.join(missing)}")
+            print(f"! not found in {'; '.join(sources)}: {', '.join(missing)}")
         if not games:
             raise SystemExit("nothing to do: none of the --only serials have a save folder")
 
@@ -416,13 +490,13 @@ def main():
             rid, rname, _ = romm.get(fname, (None, g["title"] or serial, None))
             if g["rom"] and romm and rid is None:
                 print(f"  ! {fname}: not found in RomM, rom_id left empty")
-            # exactly how webstation names its archives; RomM keys on the ".saves.zip" extension
+            # how RomM names pulled webstation archives; webstation restores any ppsspp save ending in ".zip"
             name = f"{(g['rom'] or serial)} [ppsspp {stamp}].saves.zip"
             path = os.path.join(a.zip, name)
             members = []
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
                 for d in g["folders"]:
-                    base = os.path.join(a.savedata, d)
+                    base = os.path.join(folder_src[d], d)
                     for root, _, files in os.walk(base):
                         for f in sorted(files):
                             full = os.path.join(root, f)
@@ -442,10 +516,12 @@ def main():
                 if not rid:
                     print("    skipped upload: no rom_id")
                     continue
+                reason = "--force" if a.force else ""
                 if not a.force:
-                    d = api(f"/api/roms/{rid}")
-                    if any(x.get("emulator") == "ppsspp" for x in (d.get("user_saves") or d.get("saves") or [])):
-                        print("    skipped upload: game already has a ppsspp save (use --force)")
+                    with zipfile.ZipFile(path) as z:
+                        go, reason = upload_decision(rid, save_hash(z), g["mtime"])
+                    if not go:
+                        print(f"    skipped upload: {reason}")
                         continue
                 boundary = uuid.uuid4().hex
                 body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"saveFile\"; filename=\"{name}\"\r\n"
@@ -453,7 +529,7 @@ def main():
                        f"\r\n--{boundary}--\r\n".encode()
                 q = urllib.parse.urlencode({"rom_id": rid, "emulator": "ppsspp"})
                 api(f"/api/saves?{q}", "POST", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
-                print("    uploaded")
+                print("    uploaded" + (f" ({reason})" if reason else ""))
 
 if __name__ == "__main__":
     main()

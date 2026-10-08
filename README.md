@@ -42,7 +42,9 @@ docker compose run --rm psp-saves              # dry run
 docker compose run --rm psp-saves --upload     # writes and uploads
 ```
 
-Your `SAVEDATA` folder is mounted read-only. With Docker, `ROMM_URL` is resolved from inside the
+Your `SAVEDATA` folder is mounted read-only. Compose mounts a single `SAVEDATA_DIR`. For several,
+add one `volumes:` line per folder (e.g. `- /path/two:/savedata2:ro`) and set
+`SAVEDATA_DIR: /savedata;/savedata2` under `environment:`. With Docker, `ROMM_URL` is resolved from inside the
 container: `localhost` there is the container itself, so use the host's IP or hostname, or join
 RomM's Docker network (commented example in `compose.yaml`) and use `http://romm:8080`.
 On Linux, files written to `OUT_DIR` by the container belong to root.
@@ -87,20 +89,28 @@ launch screen. `--only` is also the way to retry a single game later without tou
   serial online, then add it to `SERIAL_MAP` in `.env` (several entries separated by `;`):
   `SERIAL_MAP=ULUS10041=Grand Theft Auto - Liberty City Stories (USA)`. The value is the ROM
   file name without extension, exactly as it appears in RomM.
-- **Duplicates:** games that already have a `ppsspp` save in RomM are skipped. Use `--force` to
-  upload anyway.
+- **Duplicates:** before uploading, the script looks at the save webstation would restore for that
+  game (the newest `ppsspp` archive in RomM):
+  - no such save → upload
+  - same save files (compared by content, ignoring the archive's manifest) → skipped
+  - different, and your local save is newer than when that save reached RomM → upload
+  - different, and RomM's save is newer → skipped, so an older local save never replaces it as
+    the one webstation loads
+
+  "Newer" uses the files' modification times. Syncthing and most sync tools keep them, but some
+  copy tools set them to the copy time. Use `--force` to upload anyway.
 
 ## Settings
 
 | `.env` | Command line | |
 |---|---|---|
 | `ROMM_URL`, `ROMM_TOKEN` | – | RomM address and API token |
-| `SAVEDATA_DIR` | 1st argument | PPSSPP `SAVEDATA` folder (only read) |
+| `SAVEDATA_DIR` | 1st argument | PPSSPP `SAVEDATA` folder (only read). Several are separated by `;`: each save folder is taken from wherever its newest copy is |
 | `OUT_DIR` | `--zip DIR` | Where archives are written (default `./psp-saves`) |
 | `ROMS_DIR` | 2nd argument | Match against a local `roms/psp` folder instead of RomM's game list |
 | `SERIAL_MAP` | `--map SERIAL=ROM` | Manual matches (`;`-separated in `.env`, repeatable on the CLI) |
 | `UPLOAD` | `--upload` | Upload to RomM (`emulator=ppsspp`, no slot); implies building the archives |
-| `FORCE` | `--force` | Upload even if the game already has a `ppsspp` save |
+| `FORCE` | `--force` | Upload even if RomM already has the same or a newer `ppsspp` save |
 | `ONLY` | `--only SERIAL` | Process only these games (`;`/`,`-separated in `.env`; repeatable on the CLI, where it replaces the `.env` value). A full folder name like `ULUS10041DATA00` works too |
 | `LAYOUT` | `--layout` | `savedata` (webstation format) or `flat` (without `SAVEDATA/`) |
 | `LIBRARY_PATH` | `--library-path` | `library_path` of your webstation container, written into the manifest |
